@@ -1,0 +1,26 @@
+name = "x2bark-push"
+main = "src/index.js"
+compatibility_date = "2024-12-30"
+
+# 开启 Workers Logs，方便在控制台看日志排查
+[observability]
+enabled = true
+
+# Durable Object 托管到 Mozilla AutoPush 的 WebSocket 长连接
+[durable_objects]
+bindings = [{ name = "LISTENER", class_name = "Listener" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Listener"]
+
+# 每分钟拉活一次（DO 被驱逐/重新部署后自动恢复监听）
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+BARK_SERVER = "https://api.day.app"
+# 只推送这些通知类型，逗号分隔，留空 = 全部（常见: tweet, retweet, reply, like, follow, message）
+# NOTIFY_TYPES = "tweet"
+# 关键词过滤，逗号分隔，留空 = 不过滤
+# KEYWORDS = ""
