@@ -10,8 +10,7 @@
 - 🆓 零成本 —— Cloudflare 免费额度占用 <2%，无需服务器、无需绑卡
 - 🔒 Cookie 用得最少 —— `auth_token`/`ct0` 仅在注册订阅时用一次；通知链路端到端加密
 - 🔁 全托管自愈 —— 断线指数退避重连、cron 保活、alarm 兜底，消息靠 AutoPush 排队补投不丢失
-- 🔔 点通知直达 —— 正文链接补全为 `https://x.com/...`，iOS Universal Link 直接拉起 X App
-- 🎛️ 可过滤 —— 按通知类型 / 关键词过滤推送
+- 🎛️ 可过滤 —— 按通知类型过滤推送
 
 ## 快速开始
 
@@ -46,8 +45,11 @@ wrangler deploy
 | 变量 | 说明 |
 |---|---|
 | `BARK_SERVER` | 自建 bark-server 地址，默认 `https://api.day.app` |
-| `NOTIFY_TYPES` | 只推送这些类型（逗号分隔，如 `"tweet"`），留空全部。常见：`tweet, retweet, reply, like, follow, message` |
-| `KEYWORDS` | 标题/正文包含关键词才推（逗号分隔），留空不过滤 |
+| `NOTIFY_TYPES` | 只推送这些类型（逗号分隔），留空全部。实测可用的值：`tweet, reply, mention, follower, favorite, xchat_message_received` |
+
+## 通知类型与文案
+
+Bark 标题/正文/链接的生成规则（实测对照表）、去重逻辑与踩坑结论 👉 [PRINCIPLES.md](PRINCIPLES.md#通知类型与文案实测对照)。
 
 ## 前置条件与覆盖范围
 

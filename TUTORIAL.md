@@ -204,10 +204,9 @@ https://x2bark-push.你的子域.workers.dev/test       # 发一条测试 Bark �
 ```toml
 [vars]
 BARK_SERVER = "https://api.day.app"
-# 只推送这些类型（逗号分隔）。常见类型: tweet, retweet, reply, like, follow, message
+# 只推送这些类型（逗号分隔），留空 = 全部
+# 实测可用: tweet, reply, mention, follower, favorite, xchat_message_received
 NOTIFY_TYPES = "tweet"
-# 标题/正文包含关键词才推送（逗号分隔）
-# KEYWORDS = "公告,上线"
 ```
 
 改完记得重新部署：

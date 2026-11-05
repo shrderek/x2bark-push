@@ -7,6 +7,7 @@
 - [核心机制一：Mozilla AutoPush 协议](#核心机制一mozilla-autopush-协议)
 - [核心机制二：Web Push 消息加密](#核心机制二web-push-消息加密)
 - [核心机制三：向 X 注册订阅](#核心机制三向-x-注册订阅)
+- [通知类型与文案（实测对照）](#通知类型与文案实测对照)
 - [工程决策与踩坑记录](#工程决策与踩坑记录)
 - [免费额度分析](#免费额度分析)
 - [安全模型](#安全模型)
@@ -43,8 +44,8 @@ flowchart LR
 1. **注册阶段**（只发生一次或 cookie 更新后）：DO 生成 ECDH P-256 密钥对 → 连 AutoPush 拿到推送 endpoint → 带 cookie 调 X 的内部 API `POST /1.1/notifications/settings/login.json`，告诉 X「把通知发到这个 endpoint」
 2. **监听阶段**：DO 与 AutoPush 保持 WebSocket 长连接，挂机等待
 3. **触发阶段**：你关注并开铃铛的账号发推 → X 决定向你账号的所有"推送设备"发通知 → 用注册时上交的公钥加密通知 → 发给 Mozilla AutoPush
-4. **投递阶段**：AutoPush 通过 WebSocket 把密文推给 DO → DO 先 `ack`（防丢）→ 用私钥解密 → 按配置过滤 → 拼好文案 GET 一下 Bark
-5. **到达阶段**：Bark 通过 Apple APNs 把通知推到 iPhone，点通知用 iOS Universal Link 直达推文
+4. **投递阶段**：AutoPush 通过 WebSocket 把密文推给 DO → DO 先 `ack`（防丢）→ 用私钥解密 → 按类型过滤 → 拼好文案交给 Bark
+5. **到达阶段**：Bark 通过 Apple APNs 把通知推到 iPhone
 
 ---
 
@@ -152,7 +153,7 @@ AutoPush 投递的 `data` 是标准 Web Push 加密（RFC 8291 的 `aes128gcm`/`
 }
 ```
 
-本项目的文案处理：把相对路径 `/用户名/status/ID` 就地补全为 `https://x.com/用户名/status/ID`——iOS 对 x.com 链接有 Universal Link 支持，**点通知正文里的链接可直接拉起 X App**。
+本项目的文案处理：把相对路径 `/用户名/status/ID` 就地补全为 `https://x.com/用户名/status/ID`，让正文里的链接可点。
 
 ---
 
@@ -195,6 +196,30 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 
 ---
 
+## 通知类型与文案（实测对照）
+
+`data.type` 共实测到 6 种值（2026-11）。Bark 通知的标题/正文/链接按下面规则生成——只有 4 个特殊分支，其余原样透传 X 的文案：
+
+| 事件 | `type` | Bark 标题 | Bark 正文 | 链接 |
+|---|---|---|---|---|
+| 点赞你的推 | `favorite` | `被 <点赞者> 点赞` | 被赞推的正文 | `x.com/<handle>/status/<tag ID>` |
+| 关注你 | `follower` | 账号显示名 | `@<handle> 关注了你！` | `x.com/<handle>` |
+| 回复你的推 | `reply` | 账号显示名 | `@<handle> 回复说： <内容>` | `x.com/<handle>/status/<tag ID>` |
+| 私信 | `xchat_message_received` | 发送者显示名 | `发送了一条私信`（内容端到端加密，读不到） | `data.uri`（chat 会话链接） |
+| 原创推文 / 引用 | `tweet`（tag ID == uri ID） | 账号显示名 | 推文正文（原样） | `x.com/<handle>/status/<tag ID>` |
+| 回复别人 / 转推 | `tweet`（tag ID ≠ uri ID） | 账号显示名 | `@对方: 正文`（原样） | `data.uri`（对方原推的 canonical 链接） |
+| @提及你 | `mention` | 账号显示名 | 含 @你的正文（原样） | `x.com/<handle>/status/<tag ID>` |
+
+实测结论（供后来者少踩坑）：
+
+- **`type` 与 tag 前缀**：实测出现过 `tweet-` / `reply-` / `mention-` / `favorite-` 前缀和字面量 `follower`；X 官方博客还提到过 `retweet-` / `message-`，说明前缀随版本演化，**判定不要依赖 tag 前缀**
+- **回复别人 vs 转推**：payload 完全同构（都是 `tweet` + tag ID ≠ uri ID），无法细分；引用和原创同理（都是 `tweet` + tag ID == uri ID）
+- **reply 的正文格式**：实测原文是 `@<handle> replied: <内容>`，从不带斜杠（早期看到的 `@//<handle>/` 是把日志粘到聊天里时被自动加上斜杠的伪影，不是真实载荷）。代码仍用 `@\/{0,2}` 宽松兼容，格式突变匹配不上时原样透传，不造文案
+- **`multi_title` / `bundle_text`** 里的 `{num_total, plural...}` 是 X 的客户端聚合模板（多条同类通知折叠计数用），可参考 [X 官方工程博客](https://blog.x.com/engineering/en_us/topics/infrastructure/2019/user-centric-web-push-aggregation)。**注意**：纯图片/无文字推文的 `data.body` 是空串，取正文必须用空值合并运算符 `??` 而非逻辑或，否则空串被短路后会误用 `bundle_text`，Bark 里会显示 `{num_total, number} new ...` 原始模板；正文为空时与 X 网页版一致只推标题、不带正文
+- 通知按 `tag` 去重（最近 50 条）；tag 不带 ID 的类型（关注、私信）改用 `type + 唯一标识`（handle / 消息 ID）兜底，同一事件重复投递不重复推送，不同事件不误杀
+
+---
+
 ## 工程决策与踩坑记录
 
 按时间顺序记录几个关键决策，供移植其他 Web Push 服务时参考：
@@ -215,11 +240,10 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 6. **Workers 运行时兼容点**：
    - Node 的 `Buffer` 在 Workers 不存在 → 全部改用 `atob/btoa` + `Uint8Array`
    - 分块解密时 `crypto.subtle.decrypt` 的密文参数必须是 `ArrayBuffer`，`Uint8Array` 直接传会在 `DataView` 处炸（上游 xnotif 在 Node 下隐式依赖 Buffer 的行为掩盖了这一点）
-   - 每次注册生成唯一 `udid`（X 去重问题）
 
 7. **DO 状态持久化**：uaid、channelId、endpoint、ECDH 密钥对（JWK）、auth secret 全部存 DO storage。重新部署/驱逐后自动恢复身份，不重复注册。
 
-8. **文案兼容**：X 载荷的正文在不同通知类型下落在不同字段，按 `body` → `data.body` → `data.bundle_text` 依次取第一个非空的；正文截断 400 字符防 Bark URL 过长。
+8. **推送用 POST 而非 GET**：Bark 的 `GET /<key>/<标题>/<正文>` 在只有一段内容时会把那段当**正文**、标题被应用名顶替，空正文的通知标题就变成「Bark」。改用 `POST /push` + JSON 精确控制字段（空正文干脆不带 `body`），正文另截断 400 字符。文案映射细节见上文[通知类型与文案（实测对照）](#通知类型与文案实测对照)。
 
 ---
 
