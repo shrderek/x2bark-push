@@ -20,7 +20,6 @@ crons = ["* * * * *"]
 
 [vars]
 BARK_SERVER = "https://api.day.app"
-# 只推送这些通知类型，逗号分隔，留空 = 全部（常见: tweet, retweet, reply, like, follow, message）
+# 只推送这些通知类型，逗号分隔，留空 = 全部
+# 实测可用值: tweet, reply, mention, follower, favorite, xchat_message_received
 # NOTIFY_TYPES = "tweet"
-# 关键词过滤，逗号分隔，留空 = 不过滤
-# KEYWORDS = ""

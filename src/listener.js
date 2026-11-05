@@ -77,6 +77,15 @@ export class Listener {
     };
   }
 
+  // ---- 去重：按 tag（或 type+uri）记录最近 50 条，命中即丢弃 ----
+  async isDuplicate(key) {
+    const seen = (await this.state.storage.get("seenTags")) || [];
+    if (seen.includes(key)) return true;
+    seen.unshift(key);
+    await this.state.storage.put("seenTags", seen.slice(0, 50));
+    return false;
+  }
+
   async loadPersist() {
     return (await this.state.storage.get("persist")) || null;
   }
@@ -209,7 +218,6 @@ export class Listener {
         if (msg.status === 200) {
           console.log("[autopush] register ok, endpoint=", msg.pushEndpoint);
           this.currentEndpoint = msg.pushEndpoint;
-          this.failCount = 0;
           await this.persistState();
           markSettled();
           resolve(msg.pushEndpoint);
@@ -276,36 +284,86 @@ export class Listener {
       const n = JSON.parse(json);
       this.lastNotificationAt = new Date().toISOString();
 
-      const type = n.data?.type || "";
-      let link = n.data?.uri || "";
-      const who = n.title || n.data?.title || ""; // 通常是账号名/标题
-      const rawText = n.body || n.data?.body || n.data?.bundle_text || ""; // 通常是推文内容
+      const d = n.data || {};
+      const type = d.type || "";
+      const who = n.title || d.title || "";
+      // 注意：必须用 ?? 而不是 ||——纯图片推文的 body 是空串（假值），
+      // 用 || 会被短路跳过；bundle_text 是 X 的 ICU 聚合模板
+      // （"{num_total, number} new ..."），没有实际内容，不能兜底
+      const rawText = n.body ?? d.body ?? "";
+      const tag = d.tag || n.tag || "";
 
-      // 提取 "用户名/status/推文ID"（正文和 uri 里都可能是相对路径）
-      const sm = `${link} ${rawText}`.match(/([A-Za-z0-9_]{1,15})\/status\/(\d+)/);
+      // 去重：tag 带 ID 的（tweet-123 / reply-123...）直接用 tag；
+      // tag 是字面量（如 "follower"）或缺 tag 的（私信），用 type + 唯一标识兜底，
+      // 避免不同事件互相误杀
+      const tagId0 = tag.match(/-(\d+)$/)?.[1];
+      const dedupKey = tagId0
+        ? tag
+        : `${type}|${d.xchat_message?.["message-id"] || d.uri || rawText.slice(0, 80)}`;
+      if (await this.isDuplicate(dedupKey)) return;
 
-      // 补全网页版链接为绝对地址
-      if (link && !link.startsWith("http")) {
-        link = "https://x.com" + (link.startsWith("/") ? "" : "/") + link;
+      // 链接规则：优先 canonical 形式 x.com/<handle>/status/<id>（网页版与 App 都识别）；
+      // 其次用 data.uri 绝对化后的地址；两者都没有才兜底 /i/status/<id>。
+      // handle 仅在 tag ID 与 uri ID 一致时才可信（原创/引用/回复/点赞，uri 就是这条推）；
+      // 转推/回复别人时 tag ID 属于另一条推、handle 不可知，退回归属明确的 data.uri
+      const tagId = tagId0;
+      const uriStr = d.uri || "";
+      const uriId = uriStr.match(/\/status\/(\d+)/)?.[1] || "";
+      const uriHandle = uriStr.match(/^\/([A-Za-z0-9_]{1,15})\//)?.[1] || "";
+      const absUri = uriStr.startsWith("http") ? uriStr : uriStr ? `https://x.com${uriStr.startsWith("/") ? "" : "/"}${uriStr}` : "";
+      let link = "";
+      if (tagId && tagId === uriId && uriHandle) {
+        link = `https://x.com/${uriHandle}/status/${tagId}`;
+      } else if (absUri) {
+        link = absUri;
+      } else if (tagId) {
+        link = `https://x.com/i/status/${tagId}`;
       }
-      if ((!link || link === "https://x.com") && sm) {
-        link = `https://x.com/${sm[1]}/status/${sm[2]}`;
+
+      // 通知文案映射（2026-11 实测 6 种 type / 7 种情形，对照表见 PRINCIPLES.md）：
+      // 只有 4 个特殊分支，其余全部走 default 原样透传
+      let heading = who || "X 通知";
+      let content = rawText.replace(
+        /(^|[^/\w])\/([A-Za-z0-9_]{1,15})\/status\/(\d+)/g,
+        "$1https://x.com/$2/status/$3",
+      ).trim();
+      // 与 X 网页版通知保持一致：纯图片/无文字推文正文为空就推空内容，
+      // 只显示标题（账号显示名），不造文案
+
+      switch (type) {
+        case "favorite": {
+          // title 是 "Liked by <handle>"，不是显示名，需单独解析
+          const by = who.match(/^Liked by (.+)$/)?.[1];
+          if (by) heading = `被 ${by} 点赞`;
+          break;
+        }
+        case "follower": {
+          // body 文案不固定（"followed you back!" 等），无条件使用固定模板
+          const handle =
+            (d.uri || "").replace(/^\/+|\/+$/g, "").split("/")[0] ||
+            rawText.match(/^@(\w+)/)?.[1] || "";
+          content = handle ? `@${handle} 关注了你！` : rawText.trim();
+          if (handle) link = `https://x.com/${handle}`;
+          break;
+        }
+        case "reply": {
+          // 正文形如 "@handle replied: 内容"（实测原文从不带斜杠，正则里的 /{0,2}
+          // 只是宽松兜底早期误判的 "@//handle/" 形式），统一转成中文"回复说："
+          const m = rawText.match(/@\/{0,2}(\w+)\/?\s*replied:\s*([\s\S]*)/);
+          if (m) {
+            content = `@${m[1]} 回复说： ${m[2].trim()}`;
+          }
+          break;
+        }
+        case "xchat_message_received": {
+          // 私信内容端到端加密，读不到正文，固定文案
+          content = "发送了一条私信";
+          break;
+        }
       }
 
-      // 正文里 X 给的链接是相对路径（/用户名/status/id），补全成完整网址：
-      // 完整 x.com 链接点一下就能由 iOS Universal Link 直接拉起 X App
-      const webLink = sm ? `https://x.com/${sm[1]}/status/${sm[2]}` : link;
-      const text = webLink
-        ? rawText.replace(/\S*\/status\/\d+\S*/g, webLink).trim()
-        : rawText.trim();
-
-      // 组合出尽量完整的内容：有内容就"账号名：内容"，只有名字就显示名字
-      const content =
-        who && text && text !== who ? `${who}：${text}` : (text || who || "新通知");
-      const heading = `X · ${type || "通知"}`;
-
-      if (!passFilter(this.env, who, text, type)) return;
-      await this.barkPush(heading, content, webLink || "", n.icon);
+      if (!passTypeFilter(this.env, type)) return;
+      await this.barkPush(heading, content, link, n.icon);
     } catch (e) {
       this.lastError = `notification: ${String(e?.message || e)}`;
     }
@@ -315,12 +373,22 @@ export class Listener {
     const key = this.env.BARK_KEY;
     if (!key) throw new Error("缺少 BARK_KEY");
     const server = (this.env.BARK_SERVER || "https://api.day.app").replace(/\/+$/, "");
-    let url =
-      `${server}/${encodeURIComponent(key)}/${encodeURIComponent(heading)}/` +
-      `${encodeURIComponent(content.slice(0, 400))}` +
-      `?group=x2bark` + (link ? `&url=${encodeURIComponent(link)}` : ``);
-    if (icon) url += `&icon=${encodeURIComponent(icon)}`;
-    const res = await fetch(url);
+    // 用 POST JSON 而不是 GET URL：GET /key/只有一段时那段算「正文」不算标题，
+    // 空正文推送会被 iOS 用应用名 Bark 顶替标题行；POST 可精确控制字段，
+    // 空正文时不带 body 字段，通知只显示标题（与 X 网页版一致）
+    const payload = {
+      device_key: key,
+      title: heading,
+      group: "x2bark",
+    };
+    if (content) payload.body = content.slice(0, 400);
+    if (link) payload.url = link;
+    if (icon) payload.icon = icon;
+    const res = await fetch(`${server}/push`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
     if (!res.ok) throw new Error(`Bark 推送失败: ${res.status}`);
   }
 
@@ -389,13 +457,10 @@ export class Listener {
   }
 }
 
-function passFilter(env, title, body, type) {
-  const text = `${title} ${body}`;
+// 只按通知类型过滤：NOTIFY_TYPES 留空则全部推送
+function passTypeFilter(env, type) {
   const types = (env.NOTIFY_TYPES || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (types.length > 0 && type && !types.includes(type)) return false;
-  const keywords = (env.KEYWORDS || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (keywords.length > 0 && !keywords.some((k) => text.includes(k))) return false;
-  return true;
+  return !(types.length > 0 && type && !types.includes(type));
 }
 
 function encodeCookies(cookies) {

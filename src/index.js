@@ -8,7 +8,6 @@
 // Vars (wrangler.toml):
 //   BARK_SERVER  - 可选，默认 https://api.day.app
 //   NOTIFY_TYPES - 可选，逗号分隔只推送这些类型（留空推送全部）
-//   KEYWORDS     - 可选，逗号分隔关键词过滤（留空不过滤）
 
 import { Listener } from "./listener.js";
 
@@ -39,7 +38,7 @@ export default {
         return proxy(env, "test");
       default:
         return new Response(
-          "x2bark-push\n\nGET /status    查看连接状态\nGET /wake     确保监听运行\nGET /register 强制重新注册订阅\nGET /test     测试 Bark 推送\n",
+          "x2bark-push\n\nGET /status       查看连接状态\nGET /wake         确保监听运行\nGET /register     强制重新注册订阅\nGET /test         测试 Bark 推送\n",
           { headers: { "content-type": "text/plain; charset=utf-8" } },
         );
     }
