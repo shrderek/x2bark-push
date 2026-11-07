@@ -35,7 +35,7 @@ wrangler deploy
 
 | 路径 | 作用 |
 |---|---|
-| `/status` | 查看连接状态（connected / uaid / endpoint / 最近通知 / 最近重注册 / 最近错误） |
+| `/status` | 查看连接状态（connected / uaid / endpoint / 最近通知 / 最近重注册 / 最近自动重注册 / 最近错误） |
 | `/wake` | 手动确保监听运行（一般不用，cron 每分钟自动拉活） |
 | `/register` | 强制重新向 X 注册订阅（cookie 换新后用） |
 | `/test` | 发送测试 Bark 推送 |

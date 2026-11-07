@@ -207,6 +207,12 @@ BARK_SERVER = "https://api.day.app"
 # 只推送这些类型（逗号分隔），留空 = 全部
 # 实测可用: tweet, reply, mention, follower, favorite, xchat_message_received
 NOTIFY_TYPES = "tweet"
+
+# 以下两项是「推送链路自愈」参数，可选（默认值已内置，不写也能用）：
+# 第一重·定时：每 N 小时自动向 X 重注册订阅，应对 X 静默失效（默认 12，0=关闭）
+RE_REGISTER_HOURS = 12
+# 第二重·静默：连续 N 小时没收到 X 推送（不含 /test）则自动重注册（默认 0=关闭，建议 2）
+SILENCE_HOURS = 0
 ```
 
 改完记得重新部署：
