@@ -7,7 +7,7 @@
 - [核心机制一：Mozilla AutoPush 协议](#核心机制一mozilla-autopush-协议)
 - [核心机制二：Web Push 消息加密](#核心机制二web-push-消息加密)
 - [核心机制三：向 X 注册订阅](#核心机制三向-x-注册订阅)
-- [通知类型与文案（实测对照）](#通知类型与文案实测对照)
+- [通知类型与文案（对照）](#通知类型与文案对照)
 - [工程决策与踩坑记录](#工程决策与踩坑记录)
 - [免费额度分析](#免费额度分析)
 - [安全模型](#安全模型)
@@ -67,7 +67,7 @@ AutoPush 的 WebSocket 端点：`wss://push.services.mozilla.com/`。这是 Fire
 
 服务端回应新的（或复用的）`uaid`。**两个关键字段的设计意图**：
 
-- **`uaid`**：用户身份。持久化并在重连时带上，服务端就认得你——本项目把它存进 DO storage，所以跨部署、跨驱逐都稳定。实测重连后 `uaid` 始终不变。
+- **`uaid`**：用户身份。持久化并在重连时带上，服务端就认得你——本项目把它存进 DO storage，所以跨部署、跨驱逐都稳定。重连后 `uaid` 保持不变。
 - **`channelIDs`**：声明自己已持有的 channel。**这是整个稳定性的关键**：带上它，服务端直接复用旧 channel，**连 register 都不用发**，endpoint 长期不变；而且断线期间到达的通知会在 hello 之后立即补投（排队在 uaid 下，而不是 channel 下，所以旧身份不丢消息）。
 
 ### 2. register —— 注册推送 channel
@@ -108,7 +108,7 @@ AutoPush 的 WebSocket 端点：`wss://push.services.mozilla.com/`。这是 Fire
 
 本项目**先 ack 再解密**：解密/推送失败不影响确认，避免 AutoPush 反复重投同一通知。代价是极端情况（解密失败）会丢这一条，收益是绝不重复轰炸。
 
-### 连接生命周期（实测规律）
+### 连接生命周期
 
 ```
 connecting → ws open → hello ok（uaid 复用，跳过 register）
@@ -119,7 +119,7 @@ connecting → ws open → hello ok（uaid 复用，跳过 register）
 
 平台会周期性回收空闲 DO，这**无害**：重连只要 1 秒，断线窗口的通知靠 AutoPush 排队 + hello 补投兜住，实际表现为消息一条不丢、延迟最多 1 分钟，多数时候仍为秒级。
 
-**一个重要教训（写进代码注释）**：不要发高频 ping 保活。实测每 5 秒发一次协议 ping，AutoPush 会在第 2 次 ping 后以 `code=1011 reason=SM` 主动断连——Firefox 客户端自己是几分钟才 ping 一次。高频保活反而把连接寿命从 ~2 分钟压到 15 秒。
+**一个重要教训（写进代码注释）**：不要发高频 ping 保活。每 5 秒发一次协议 ping，AutoPush 会在第 2 次 ping 后以 `code=1011 reason=SM` 主动断连——Firefox 客户端自己是几分钟才 ping 一次。高频保活反而把连接寿命从 ~2 分钟压到 15 秒。
 
 ---
 
@@ -190,13 +190,13 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 }
 ```
 
-**`udid` 唯一化的教训**：最初版本写死 `udid: "Web/Chrome"`，实测收不到任何通知——X 按 udid 维护设备记录，固定 ID 时新注册可能不覆盖旧记录，推送全发给了早已失效的旧 endpoint。改成每次注册生成唯一 udid 后问题消失。
+**`udid` 唯一化的教训**：最初版本写死 `udid: "Web/Chrome"`，收不到任何通知——X 按 udid 维护设备记录，固定 ID 时新注册可能不覆盖旧记录，推送全发给了早已失效的旧 endpoint。改成每次注册生成唯一 udid 后问题消失。
 
 **`x-client-transaction-id`**：X 前端给每个请求算的一个混淆头（时间戳 + 方法/路径的 SHA-256 + 动画密钥 XOR）。本项目移植了 xnotif 的实现：`generateTransactionId` 从 fa0311 维护的 pair 字典随机取一组 verification/animationKey，算法细节见 `listener.js`。这是 X 侧唯一"复杂"的对抗点，也是上游失效风险所在（X 改算法需要上游更新）。
 
 ### 订阅会失效：为什么需要定期重注册
 
-注册不是「一劳永逸」的。实测表明，X 会在一段时间后把这条 Web Push 订阅**在服务端静默失效**——你这边一切正常，却再也收不到推送，且没有任何报错。这正是「全托管自愈」要解决的问题，这里讲清根因。
+注册不是「一劳永逸」的。X 会在一段时间后把这条 Web Push 订阅**在服务端静默失效**——你这边一切正常，却再也收不到推送，且没有任何报错。这正是「全托管自愈」要解决的问题，这里讲清根因。
 
 **两套相互独立的「半边订阅」：**
 
@@ -208,8 +208,8 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 **为什么会失效：**
 
 - 每次注册我们都用**全新的随机 `udid`**（见上 `udid` 唯一化的教训），对 X 而言每次注册都是一个「新设备」。
-- X 似乎对 Web Push 的设备记录设有**服务端 TTL / 闲置回收**：一条没被「刷新」过的旧设备记录，过一段时间就不再被投递。实测表现就是某天早上（约 9 点）突然收不到，期间 `/status` 仍 `connected: true`、endpoint 未变、`lastError` 为空。
-- 而我们的 `ensure()` 一旦发现 uaid 还能复用（`savedEndpoint === currentEndpoint`），就**跳过重注册**——它以为「什么都没变，不用重新告诉 X」。于是 X 那侧的失效记录永远得不到刷新，表现成「静默断流」（这是 2026-11-07 当天实测到的真实故障）。
+- X 似乎对 Web Push 的设备记录设有**服务端 TTL / 闲置回收**：一条没被「刷新」过的旧设备记录，过一段时间就不再被投递。典型表现是突然收不到推送，但 `/status` 仍 `connected: true`、endpoint 未变、`lastError` 为空——单看状态完全正常，这正是「静默断流」难排查的原因。
+- 而我们的 `ensure()` 一旦发现 uaid 还能复用（`savedEndpoint === currentEndpoint`），就**跳过重注册**——它以为「什么都没变，不用重新告诉 X」。于是 X 那侧的失效记录永远得不到刷新，表现成「静默断流」。
 
 **为什么定期重注册能解决：**
 
@@ -219,9 +219,9 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 
 ---
 
-## 通知类型与文案（实测对照）
+## 通知类型与文案（对照）
 
-`data.type` 共实测到 6 种值（2026-11）。Bark 通知的标题/正文/链接按下面规则生成——只有 4 个特殊分支，其余原样透传 X 的文案：
+`data.type` 共 6 种值。Bark 通知的标题/正文/链接按下面规则生成——只有 4 个特殊分支，其余原样透传 X 的文案：
 
 | 事件 | `type` | Bark 标题 | Bark 正文 | 链接 |
 |---|---|---|---|---|
@@ -233,11 +233,11 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 | 回复别人 / 转推 | `tweet`（tag ID ≠ uri ID） | 账号显示名 | `@对方: 正文`（原样） | `data.uri`（对方原推的 canonical 链接） |
 | @提及你 | `mention` | 账号显示名 | 含 @你的正文（原样） | `x.com/<handle>/status/<tag ID>` |
 
-实测结论（供后来者少踩坑）：
+结论：
 
-- **`type` 与 tag 前缀**：实测出现过 `tweet-` / `reply-` / `mention-` / `favorite-` 前缀和字面量 `follower`；X 官方博客还提到过 `retweet-` / `message-`，说明前缀随版本演化，**判定不要依赖 tag 前缀**
+- **`type` 与 tag 前缀**：可见 `tweet-` / `reply-` / `mention-` / `favorite-` 前缀和字面量 `follower`；X 官方博客还提到过 `retweet-` / `message-`，说明前缀随版本演化，**判定不要依赖 tag 前缀**
 - **回复别人 vs 转推**：payload 完全同构（都是 `tweet` + tag ID ≠ uri ID），无法细分；引用和原创同理（都是 `tweet` + tag ID == uri ID）
-- **reply 的正文格式**：实测原文是 `@<handle> replied: <内容>`，从不带斜杠（早期看到的 `@//<handle>/` 是把日志粘到聊天里时被自动加上斜杠的伪影，不是真实载荷）。代码仍用 `@\/{0,2}` 宽松兼容，格式突变匹配不上时原样透传，不造文案
+- **reply 的正文格式**：原文为 `@<handle> replied: <内容>`，从不带斜杠（历史上出现过 `@//<handle>/` 形式的变体，属转发伪影而非真实载荷）。代码仍用 `@\/{0,2}` 宽松兼容，格式突变匹配不上时原样透传，不造文案
 - **`multi_title` / `bundle_text`** 里的 `{num_total, plural...}` 是 X 的客户端聚合模板（多条同类通知折叠计数用），可参考 [X 官方工程博客](https://blog.x.com/engineering/en_us/topics/infrastructure/2019/user-centric-web-push-aggregation)。**注意**：纯图片/无文字推文的 `data.body` 是空串，取正文必须用空值合并运算符 `??` 而非逻辑或，否则空串被短路后会误用 `bundle_text`，Bark 里会显示 `{num_total, number} new ...` 原始模板；正文为空时与 X 网页版一致只推标题、不带正文
 - 通知按 `tag` 去重（最近 50 条）；tag 不带 ID 的类型（关注、私信）改用 `type + 唯一标识`（handle / 消息 ID）兜底，同一事件重复投递不重复推送，不同事件不误杀
 
@@ -254,7 +254,7 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
    - DO alarm 是 cron 失效时的最后防线
    - `scheduleReconnect` 断线后 1s 起步指数退避（上限 5 分钟），连接成功即重置——平台每 ~2 分钟回收连接，实际远到不了上限
 
-3. **不发高频 ping**：见上文实测教训（1011/SM）。「空闲回收 → 快速重连 → hello 补投」的组合比保活更省心。
+3. **不发高频 ping**：见上文连接生命周期说明（1011/SM）。「空闲回收 → 快速重连 → hello 补投」的组合比保活更省心。
 
 4. **endpoint 稳定化**：hello 带 `channelIDs` 后，重连走 uaid 复用路径，register 和向 X 的注册都跳过。此前每次重连都 register + 向 X 注册（~1440 次/天），虽然没被风控但毫无必要。
 
@@ -266,7 +266,7 @@ POST https://x.com/i/api/1.1/notifications/settings/login.json
 
 7. **DO 状态持久化**：uaid、channelId、endpoint、ECDH 密钥对（JWK）、auth secret 全部存 DO storage。重新部署/驱逐后自动恢复身份，不重复注册。
 
-8. **推送用 POST 而非 GET**：Bark 的 `GET /<key>/<标题>/<正文>` 在只有一段内容时会把那段当**正文**、标题被应用名顶替，空正文的通知标题就变成「Bark」。改用 `POST /push` + JSON 精确控制字段（空正文干脆不带 `body`），正文另截断 400 字符。文案映射细节见上文[通知类型与文案（实测对照）](#通知类型与文案实测对照)。
+8. **推送用 POST 而非 GET**：Bark 的 `GET /<key>/<标题>/<正文>` 在只有一段内容时会把那段当**正文**、标题被应用名顶替，空正文的通知标题就变成「Bark」。改用 `POST /push` + JSON 精确控制字段（空正文干脆不带 `body`），正文另截断 400 字符。文案映射细节见上文[通知类型与文案（对照）](#通知类型与文案对照)。
 
 9. **推送链路自愈（两重自动重注册）**：X 会周期性地把推送订阅在服务端静默失效，而 Worker 的 AutoPush 长连接仍在、endpoint 也没变，于是代码因「uaid 复用跳过 registerWithX」永远不向 X 重注册 → 表现为「收不到但无报错」（根因见上文[订阅会失效：为什么需要定期重注册](#订阅会失效为什么需要定期重注册)）。为此加了两道自动重注册，都带 1h 退避（两次重注册最小间隔 1h，避免疯狂重注册）：
    - **第一重（定时）**：`RE_REGISTER_HOURS`（默认 12）控制，距上次【自动】重注册超过该时长就重注册一次，让订阅定期刷新。

@@ -45,13 +45,13 @@ wrangler deploy
 | 变量 | 说明 |
 |---|---|
 | `BARK_SERVER` | 自建 bark-server 地址，默认 `https://api.day.app` |
-| `NOTIFY_TYPES` | 只推送这些类型（逗号分隔），留空全部。实测可用的值：`tweet, reply, mention, follower, favorite, xchat_message_received` |
+| `NOTIFY_TYPES` | 只推送这些类型（逗号分隔），留空全部。可用的值：`tweet, reply, mention, follower, favorite, xchat_message_received` |
 | `RE_REGISTER_HOURS` | **推送链路自愈·第一重**：每隔 N 小时自动向 X 重注册订阅（应对 X 静默失效订阅），`0` = 关闭，**默认 12**。计时只看自动重注册，手动 `/register` 不计入 |
 | `SILENCE_HOURS` | **推送链路自愈·第二重**：连续 N 小时没收到 X 推送（不含 `/test`）则自动重注册，`0` = 关闭（**默认关闭**），想开启填 `2`。同样不计入手动 `/register` |
 
 ## 通知类型与文案
 
-Bark 标题/正文/链接的生成规则（实测对照表）、去重逻辑与踩坑结论 👉 [PRINCIPLES.md](PRINCIPLES.md#通知类型与文案实测对照)。
+Bark 标题/正文/链接的生成规则（对照表）、去重逻辑与结论 👉 [PRINCIPLES.md](PRINCIPLES.md#通知类型与文案对照)。
 
 ## 前置条件与覆盖范围
 
