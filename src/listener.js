@@ -14,6 +14,7 @@ const PAIR_URL =
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000; // alarm 兜底自检间隔
 const MAX_RECONNECT_DELAY = 5 * 60 * 1000;
+const RE_REGISTER_COOLDOWN_MS = 60 * 60 * 1000; // 退避：两次自动重注册最小间隔 1h，避免疯狂重注册
 
 export class Listener {
   constructor(state, env) {
@@ -27,6 +28,7 @@ export class Listener {
     this.reconnectDelay = 1000;
     this.closed = false;
     this.lastNotificationAt = null;
+    this.lastRegisterAt = 0;
     this.lastError = null;
     this.connecting = null; // 进行中的 connect promise，防止并发重连
   }
@@ -72,7 +74,8 @@ export class Listener {
       connected: !!(this.ws && this.ws.readyState === 1),
       uaid: this.uaid || null,
       endpoint: this.savedEndpoint || null,
-      lastNotificationAt: this.lastNotificationAt,
+      lastNotificationAt: this.lastNotificationAt ? new Date(this.lastNotificationAt).toISOString() : null,
+      lastRegisterAt: this.lastRegisterAt ? new Date(this.lastRegisterAt).toISOString() : null,
       lastError: this.lastError,
     };
   }
@@ -90,17 +93,60 @@ export class Listener {
     return (await this.state.storage.get("persist")) || null;
   }
 
+  // 自愈相关的时间戳（跨 DO 重启不丢）：上次收到 X 推送、上次重注册
+  async loadMeta() {
+    return (await this.state.storage.get("meta")) || {};
+  }
+
+  async saveMeta(patch) {
+    const m = (await this.state.storage.get("meta")) || {};
+    Object.assign(m, patch);
+    await this.state.storage.put("meta", m);
+  }
+
+  // ---- 两重自愈：自动向 X 重注册，避免「X 静默失效 → 收不到但无报错」 ----
+  // 第一重（定时）：距上次重注册 > RE_REGISTER_HOURS 则重注册（默认每 12h）。
+  // 第二重（静默）：连续 SILENCE_HOURS 没收到 X 推送（不含 /test）则重注册（默认关闭）。
+  // 两者都受 1h 退避约束：两次重注册至少间隔 1h，避免疯狂重注册。
+  async maybeAutoRegister() {
+    if (!this.currentEndpoint) return;
+    const now = Date.now();
+    const sinceReg = now - (this.lastRegisterAt || 0);
+    if (sinceReg < RE_REGISTER_COOLDOWN_MS) return; // 退避期内，不重注册
+    const reRegMs = hoursToMs(this.env.RE_REGISTER_HOURS);
+    const silenceMs = hoursToMs(this.env.SILENCE_HOURS);
+    const layer1 = reRegMs > 0 && sinceReg > reRegMs;
+    const sinceNotif = this.lastNotificationAt ? now - this.lastNotificationAt : 0;
+    const layer2 = silenceMs > 0 && this.lastNotificationAt && sinceNotif > silenceMs;
+    if (layer1 || layer2) {
+      console.log(
+        `[self-heal] 触发自动重注册 layer1=${layer1} layer2=${layer2} sinceReg=${Math.round(sinceReg / 3600000)}h`,
+      );
+      await this.registerWithX();
+    }
+  }
+
   async ensure(forceRegister) {
     this.closed = false;
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
 
     if (this.ws && this.ws.readyState === 1) {
-      if (forceRegister) await this.registerWithX();
+      if (forceRegister) {
+        await this.registerWithX();
+      } else {
+        const meta = await this.loadMeta();
+        this.lastRegisterAt = meta.lastRegisterAt || 0;
+        this.lastNotificationAt = meta.lastNotificationAt || null;
+        await this.maybeAutoRegister();
+      }
       return;
     }
     if (this.connecting) return this.connecting;
 
     const persist = await this.loadPersist();
+    const meta = await this.loadMeta();
+    this.lastRegisterAt = meta.lastRegisterAt || 0;
+    this.lastNotificationAt = meta.lastNotificationAt || null;
     this.decryptor = await createDecryptor(persist?.jwk, persist?.auth);
     this.channelId = persist?.channelId || crypto.randomUUID();
     this.savedEndpoint = persist?.endpoint || null;
@@ -111,6 +157,8 @@ export class Listener {
     await this.connecting;
     if (forceRegister || this.savedEndpoint !== this.currentEndpoint) {
       await this.registerWithX();
+    } else {
+      await this.maybeAutoRegister();
     }
   }
 
@@ -282,7 +330,8 @@ export class Listener {
         payload.buffer,
       );
       const n = JSON.parse(json);
-      this.lastNotificationAt = new Date().toISOString();
+      this.lastNotificationAt = Date.now();
+      await this.saveMeta({ lastNotificationAt: this.lastNotificationAt });
 
       const d = n.data || {};
       const type = d.type || "";
@@ -395,6 +444,9 @@ export class Listener {
   // ---- 向 X 注册推送订阅（移植自 twitter.ts）----
 
   async registerWithX() {
+    // 记录重注册时间（含失败），供自愈退避使用，避免疯狂重试
+    this.lastRegisterAt = Date.now();
+    await this.saveMeta({ lastRegisterAt: this.lastRegisterAt });
     if (!this.currentEndpoint) throw new Error("尚未获得 AutoPush endpoint");
     const cookies = {
       auth_token: this.env.AUTH_TOKEN,
@@ -465,6 +517,12 @@ function passTypeFilter(env, type) {
 
 function encodeCookies(cookies) {
   return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+// 把「小时」配置转成毫秒；<=0 或非数字视为关闭（返回 0）
+function hoursToMs(v) {
+  const n = parseFloat(v);
+  return Number.isFinite(n) && n > 0 ? n * 3600 * 1000 : 0;
 }
 
 // 移植自 twitter.ts 的 generateTransactionId（Buffer -> btoa）

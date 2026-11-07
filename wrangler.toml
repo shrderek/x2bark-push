@@ -20,6 +20,11 @@ crons = ["* * * * *"]
 
 [vars]
 BARK_SERVER = "https://api.day.app"
+# 推送链路自愈（应对 X 静默失效订阅导致「收不到但不报错」）：
+# 第一重：每隔 N 小时自动向 X 重注册订阅，0 = 关闭，默认 12
+RE_REGISTER_HOURS = 12
+# 第二重：连续 N 小时没收到 X 推送（不含 /test）则自动重注册，0 = 关闭（默认关闭），想开启填 2
+SILENCE_HOURS = 0
 # 只推送这些通知类型，逗号分隔，留空 = 全部
 # 实测可用值: tweet, reply, mention, follower, favorite, xchat_message_received
 # NOTIFY_TYPES = "tweet"
