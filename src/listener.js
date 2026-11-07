@@ -11,6 +11,9 @@ const HEADER_URL =
   "https://raw.githubusercontent.com/fa0311/latest-user-agent/refs/heads/main/header.json";
 const PAIR_URL =
   "https://raw.githubusercontent.com/fa0311/x-client-transaction-id-pair-dict/refs/heads/main/pair.json";
+// 错误告警里「日常维护」教程链接（TUTORIAL.md 的 #日常维护 锚点）
+const TUTORIAL_URL =
+  "https://github.com/shrderek/x2bark-push/blob/main/TUTORIAL.md#%E6%97%A5%E5%B8%B8%E7%BB%B4%E6%8A%A4";
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000; // alarm 兜底自检间隔
 const MAX_RECONNECT_DELAY = 5 * 60 * 1000;
@@ -31,6 +34,7 @@ export class Listener {
     this.lastRegisterAt = 0;
     this.lastAutoRegisterAt = 0;
     this.lastError = null;
+    this.lastAlertedError = null; // 上一条已发 Bark 告警的 cookie 错误码（401/403），用于去重与恢复
     this.connecting = null; // 进行中的 connect promise，防止并发重连
   }
 
@@ -53,7 +57,7 @@ export class Listener {
           break;
       }
     } catch (e) {
-      this.lastError = String(e?.message || e);
+      this.setError(e);
     }
     return Response.json(await this.statusObj());
   }
@@ -64,7 +68,7 @@ export class Listener {
       try {
         await this.ensure(false);
       } catch (e) {
-        this.lastError = String(e?.message || e);
+        this.setError(e);
       }
     }
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
@@ -141,6 +145,7 @@ export class Listener {
         this.lastRegisterAt = meta.lastRegisterAt || 0;
         this.lastAutoRegisterAt = meta.lastAutoRegisterAt || 0;
         this.lastNotificationAt = meta.lastNotificationAt || null;
+        this.lastAlertedError = meta.lastAlertedError || null;
         await this.maybeAutoRegister();
       }
       return;
@@ -152,6 +157,7 @@ export class Listener {
     this.lastRegisterAt = meta.lastRegisterAt || 0;
     this.lastAutoRegisterAt = meta.lastAutoRegisterAt || 0;
     this.lastNotificationAt = meta.lastNotificationAt || null;
+    this.lastAlertedError = meta.lastAlertedError || null;
     this.decryptor = await createDecryptor(persist?.jwk, persist?.auth);
     this.channelId = persist?.channelId || crypto.randomUUID();
     this.savedEndpoint = persist?.endpoint || null;
@@ -210,8 +216,8 @@ export class Listener {
 
       this.ws.addEventListener("message", (event) => {
         this.onMessage(String(event.data), resolve, reject, settle).catch((e) => {
-          console.log("[autopush] onMessage error:", e?.stack || String(e));
-          this.lastError = String(e?.message || e);
+        console.log("[autopush] onMessage error:", e?.stack || String(e));
+        this.setError(e);
         });
       });
 
@@ -227,7 +233,7 @@ export class Listener {
 
       this.ws.addEventListener("error", () => {
         console.log("[autopush] ws error");
-        this.lastError = "websocket error";
+        this.setError("websocket error");
         if (!settled) {
           settled = true;
           reject(new Error("websocket error"));
@@ -278,7 +284,7 @@ export class Listener {
           resolve(msg.pushEndpoint);
         } else {
           console.log("[autopush] register failed:", JSON.stringify(msg));
-          this.lastError = `register failed: ${msg.status}`;
+          this.setError(`register failed: ${msg.status}`);
           reject(new Error(this.lastError));
         }
         break;
@@ -313,7 +319,7 @@ export class Listener {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
-      this.ensure(false).catch((e) => (this.lastError = String(e?.message || e)));
+      this.ensure(false).catch((e) => this.setError(e));
     }, this.reconnectDelay);
   }
 
@@ -421,11 +427,11 @@ export class Listener {
       if (!passTypeFilter(this.env, type)) return;
       await this.barkPush(heading, content, link, n.icon);
     } catch (e) {
-      this.lastError = `notification: ${String(e?.message || e)}`;
+      this.setError(`notification: ${String(e?.message || e)}`);
     }
   }
 
-  async barkPush(heading, content, link = "", icon = "") {
+  async barkPush(heading, content, link = "", icon = "", group = "x2bark") {
     const key = this.env.BARK_KEY;
     if (!key) throw new Error("缺少 BARK_KEY");
     const server = (this.env.BARK_SERVER || "https://api.day.app").replace(/\/+$/, "");
@@ -435,7 +441,7 @@ export class Listener {
     const payload = {
       device_key: key,
       title: heading,
-      group: "x2bark",
+      group,
     };
     if (content) payload.body = content.slice(0, 400);
     if (link) payload.url = link;
@@ -446,6 +452,46 @@ export class Listener {
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(`Bark 推送失败: ${res.status}`);
+  }
+
+  // ---- 错误告警：仅当 X 明确拒绝 cookie（login.json 401/403）时发 Bark 通知 ----
+  // 其余错误（连接/解密失败、X 抖动 5xx）不发，避免噪音；Bark 自身失败（522 等）
+  // 发不出也不发，避免循环。去重：lastAlertedError 记已告警的错误码，同错不重复；
+  // 恢复在 registerWithX 成功路径触发（见该方法末尾）。
+  setError(msg) {
+    this.lastError = String(msg?.message || msg);
+    this.maybeAlertError().catch((e) =>
+      console.log("[alert] maybeAlertError error:", e?.stack || String(e)),
+    );
+  }
+
+  async maybeAlertError() {
+    const err = this.lastError;
+    const m = err && err.match(/login\.json failed \((401|403)\)/);
+    if (!m) return; // 非 cookie 拒绝类错误，不告警
+    const code = m[1];
+    if (code === this.lastAlertedError) return; // 同错不重复发
+    const reason =
+      code === "401"
+        ? "Cookie 被拒（通常登出/改密）"
+        : "Cookie 错误（AUTH_TOKEN与CT0数值错误）";
+    const fix =
+      code === "401"
+        ? "重新登录X，更新AUTH_TOKEN与CT0后访问 /register（详情见TUTORIAL.md #日常维护）"
+        : "更新正确的AUTH_TOKEN与CT0后访问 /register（详情见TUTORIAL.md #日常维护）";
+    try {
+      await this.barkPush(
+        `⚠️ x2bark 错误：${code}`,
+        `错误原因：${reason}\n解决方法：${fix}`,
+        TUTORIAL_URL,
+        "",
+        "x2bark-alert",
+      );
+      this.lastAlertedError = code;
+      await this.saveMeta({ lastAlertedError: code });
+    } catch (e) {
+      console.log("[alert] bark push failed, skip:", e?.stack || String(e));
+    }
   }
 
   // ---- 向 X 注册推送订阅（移植自 twitter.ts）----
@@ -521,6 +567,17 @@ export class Listener {
     if (!res.ok) {
       throw new Error(`login.json failed (${res.status}): ${bodyText}`);
     }
+    // 注册成功：若之前因 cookie 被拒（401/403）告警过，发「已恢复」并清状态
+    if (this.lastAlertedError) {
+      try {
+        await this.barkPush("✅ x2bark 已恢复", "cookie错误清除，监听恢复正常。", "", "", "x2bark-alert");
+      } catch (e) {
+        console.log("[alert] bark push failed, skip:", e?.stack || String(e));
+      }
+      this.lastAlertedError = null;
+      await this.saveMeta({ lastAlertedError: null });
+    }
+    this.lastError = null; // 注册成功即链路健康，同步清掉历史错误
   }
 }
 
