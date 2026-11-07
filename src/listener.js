@@ -29,6 +29,7 @@ export class Listener {
     this.closed = false;
     this.lastNotificationAt = null;
     this.lastRegisterAt = 0;
+    this.lastAutoRegisterAt = 0;
     this.lastError = null;
     this.connecting = null; // 进行中的 connect promise，防止并发重连
   }
@@ -76,6 +77,7 @@ export class Listener {
       endpoint: this.savedEndpoint || null,
       lastNotificationAt: this.lastNotificationAt ? new Date(this.lastNotificationAt).toISOString() : null,
       lastRegisterAt: this.lastRegisterAt ? new Date(this.lastRegisterAt).toISOString() : null,
+      lastAutoRegisterAt: this.lastAutoRegisterAt ? new Date(this.lastAutoRegisterAt).toISOString() : null,
       lastError: this.lastError,
     };
   }
@@ -105,14 +107,15 @@ export class Listener {
   }
 
   // ---- 两重自愈：自动向 X 重注册，避免「X 静默失效 → 收不到但无报错」 ----
-  // 第一重（定时）：距上次重注册 > RE_REGISTER_HOURS 则重注册（默认每 12h）。
+  // 第一重（定时）：距上次【自动】重注册 > RE_REGISTER_HOURS 则重注册（默认每 12h）。
   // 第二重（静默）：连续 SILENCE_HOURS 没收到 X 推送（不含 /test）则重注册（默认关闭）。
-  // 两者都受 1h 退避约束：两次重注册至少间隔 1h，避免疯狂重注册。
+  // 退避（1h 最小间隔）只统计【自动】重注册：手动 /register 不写入 lastAutoRegisterAt，
+  // 因此手动救活后，自动自愈仍可按原节奏兜底，不会被 1h/12h 时间压制。
   async maybeAutoRegister() {
     if (!this.currentEndpoint) return;
     const now = Date.now();
-    const sinceReg = now - (this.lastRegisterAt || 0);
-    if (sinceReg < RE_REGISTER_COOLDOWN_MS) return; // 退避期内，不重注册
+    const sinceReg = now - (this.lastAutoRegisterAt || 0);
+    if (sinceReg < RE_REGISTER_COOLDOWN_MS) return; // 退避期内（仅看自动重注册），不重注册
     const reRegMs = hoursToMs(this.env.RE_REGISTER_HOURS);
     const silenceMs = hoursToMs(this.env.SILENCE_HOURS);
     const layer1 = reRegMs > 0 && sinceReg > reRegMs;
@@ -122,7 +125,7 @@ export class Listener {
       console.log(
         `[self-heal] 触发自动重注册 layer1=${layer1} layer2=${layer2} sinceReg=${Math.round(sinceReg / 3600000)}h`,
       );
-      await this.registerWithX();
+      await this.registerWithX({ auto: true });
     }
   }
 
@@ -136,6 +139,7 @@ export class Listener {
       } else {
         const meta = await this.loadMeta();
         this.lastRegisterAt = meta.lastRegisterAt || 0;
+        this.lastAutoRegisterAt = meta.lastAutoRegisterAt || 0;
         this.lastNotificationAt = meta.lastNotificationAt || null;
         await this.maybeAutoRegister();
       }
@@ -146,6 +150,7 @@ export class Listener {
     const persist = await this.loadPersist();
     const meta = await this.loadMeta();
     this.lastRegisterAt = meta.lastRegisterAt || 0;
+    this.lastAutoRegisterAt = meta.lastAutoRegisterAt || 0;
     this.lastNotificationAt = meta.lastNotificationAt || null;
     this.decryptor = await createDecryptor(persist?.jwk, persist?.auth);
     this.channelId = persist?.channelId || crypto.randomUUID();
@@ -155,8 +160,10 @@ export class Listener {
 
     this.connecting = this.connect().finally(() => (this.connecting = null));
     await this.connecting;
-    if (forceRegister || this.savedEndpoint !== this.currentEndpoint) {
-      await this.registerWithX();
+    if (forceRegister) {
+      await this.registerWithX(); // 手动 /register：不计入自动退避
+    } else if (this.savedEndpoint !== this.currentEndpoint) {
+      await this.registerWithX({ auto: true }); // endpoint 变更，属自动，计入退避
     } else {
       await this.maybeAutoRegister();
     }
@@ -443,10 +450,18 @@ export class Listener {
 
   // ---- 向 X 注册推送订阅（移植自 twitter.ts）----
 
-  async registerWithX() {
-    // 记录重注册时间（含失败），供自愈退避使用，避免疯狂重试
+  async registerWithX({ auto = false } = {}) {
+    // 记录重注册时间：
+    //  lastRegisterAt —— 任何注册（手动/自动）都记，仅用于 /status 展示；
+    //  lastAutoRegisterAt —— 仅当 auto=true 时记，驱动 1h 退避与 12h 定时。
+    //  手动 /register 不写入 lastAutoRegisterAt，因此不会压制后续自动自愈。
     this.lastRegisterAt = Date.now();
-    await this.saveMeta({ lastRegisterAt: this.lastRegisterAt });
+    const patch = { lastRegisterAt: this.lastRegisterAt };
+    if (auto) {
+      this.lastAutoRegisterAt = this.lastRegisterAt;
+      patch.lastAutoRegisterAt = this.lastAutoRegisterAt;
+    }
+    await this.saveMeta(patch);
     if (!this.currentEndpoint) throw new Error("尚未获得 AutoPush endpoint");
     const cookies = {
       auth_token: this.env.AUTH_TOKEN,
